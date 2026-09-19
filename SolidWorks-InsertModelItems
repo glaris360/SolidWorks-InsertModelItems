@@ -1,0 +1,658 @@
+Option Explicit
+
+'============================================================
+' 図面自動作成マクロ
+'
+' Version : 1.0
+' Date    : 2026/09/24
+'
+' 【処理概要】
+'  1. アクティブ文書がSLDPRTか確認
+'  2. SLDPRTが保存済みか確認
+'  3. 同名SLDDRWが存在しないことを確認
+'  4. 必要テンプレート・QRマクロの存在確認
+'  5. A4図面を新規作成
+'  6. 第三角法3面図を自動作成
+'     ・正面図
+'     ・右側面図
+'     ・平面図
+'  7. モデルアイテムを挿入
+'     ・モデル全体
+'     ・図面に指定された寸法
+'     ・穴寸法テキスト
+'  8. 今回挿入した寸法だけ自動配列
+'  9. 正面図を基準に部品表を挿入
+' 10. QR_test02.swpを実行
+' 11. 元SLDPRTと同じフォルダへ同名SLDDRWとして保存
+'============================================================
+
+'============================================================
+' ユーザー設定
+'============================================================
+' 新規図面作成用 .drwdot
+Private Const DRAW_TEMPLATE_PATH As String = "C:\ProgramData\SolidWorks\SOLIDWORKS 2026\templates\図面.drwdot"
+
+' A4シートフォーマット
+Private Const SHEET_FORMAT_PATH As String = _
+    "C:\ProgramData\SolidWorks\SOLIDWORKS 2026\lang\japanese\sheetformat\a4 - iso.slddrt"
+
+' BOMテンプレート
+Private Const BOM_TEMPLATE_PATH As String = _
+    "C:\Program Files\Dassault Systemes\SOLIDWORKS 3DEXPERIENCE R2026x\SOLIDWORKS\lang\japanese\bom-standard.sldbomtbt"
+
+' QRコード挿入マクロ
+Private Const QR_MACRO_PATH As String = _
+    "C:\Users\nnbmk\Documents\SolidWorks\20260818_QRコード自動挿入\QR_test02.swp"
+Private Const QR_MODULE_NAME As String = "QR_test021"
+Private Const QR_PROCEDURE_NAME As String = "main"
+
+' BOM配置位置
+' 単位：mm、A4縦：幅210mm x 高さ297 mm
+Private Const BOM_X_MM As Double = 205#
+Private Const BOM_Y_MM As Double = 287#
+
+' 自動配列時の最小間隔
+' 単位：m、0.001 = 1mm
+Private Const AUTO_ARRANGE_SPACING As Double = 0.001
+
+'============================================================
+' メイン処理
+'============================================================
+
+Sub main()
+
+    ' SOLIDWORKS関係
+    Dim swApp As SldWorks.SldWorks
+    Dim swPartModel As SldWorks.ModelDoc2
+    Dim swDrawModel As SldWorks.ModelDoc2
+    Dim swDraw As SldWorks.DrawingDoc
+    Dim swSheet As SldWorks.Sheet
+    Dim swFrontView As SldWorks.View
+    Dim swBomTable As SldWorks.BomTableAnnotation
+
+    ' ファイルパス
+    Dim partPath As String
+    Dim drawingPath As String
+    Dim drawingTemplatePath As String
+
+    ' モデルアイテム
+    Dim vAnnotations As Variant
+    Dim swAnnotation As SldWorks.Annotation
+    Dim swSelMgr As SldWorks.SelectionMgr
+    Dim swSelData As SldWorks.SelectData
+    Dim annotationTypes As Long
+    Dim dimensionCount As Long
+    Dim i As Long
+
+    ' その他
+    Dim boolStatus As Boolean
+    Dim qrResult As Boolean
+    Dim qrError As Long
+    Dim saveStatus As Long
+    Dim configName As String
+
+    ' SOLIDWORKSの自動縮尺設定を一時的に変更するための変数
+    Dim oldAutoScale As Boolean
+    Dim autoScaleChanged As Boolean
+
+    ' エラー発生時は ErrorHandler へ
+    On Error GoTo ErrorHandler
+
+    ' 1. SOLIDWORKSへ接続
+    Set swApp = Application.SldWorks
+
+    '========================================================
+    ' 2. アクティブ文書を取得
+    '========================================================
+    Set swPartModel = swApp.ActiveDoc
+    If swPartModel Is Nothing Then
+        MsgBox _
+            "開いているドキュメントがありません。" & vbCrLf & vbCrLf & _
+            "SLDPRTを開いてからマクロを実行してください。", _
+            vbExclamation, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    '========================================================
+    ' 3. SLDPRTか確認
+    '========================================================
+    If swPartModel.GetType <> swDocPART Then
+        MsgBox _
+            "このマクロはSLDPRTから図面を作成します。" & vbCrLf & vbCrLf & _
+            "部品ファイルをアクティブにしてから実行してください。", _
+            vbExclamation, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    '========================================================
+    ' 4. SLDPRTが保存済みか確認
+    '========================================================
+    partPath = swPartModel.GetPathName
+    If Len(partPath) = 0 Then
+        MsgBox _
+            "部品ファイルがまだ保存されていません。" & vbCrLf & vbCrLf & _
+            "SLDPRTを保存してからマクロを実行してください。", _
+            vbExclamation, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    '========================================================
+    ' 5. 未保存の変更がないか確認
+    ' 一度保存済みでも、その後編集して保存していない場合を検出
+    '========================================================
+    If swPartModel.GetSaveFlag Then
+        MsgBox _
+            "部品に未保存の変更があります。" & vbCrLf & vbCrLf & _
+            "SLDPRTを保存してから、もう一度マクロを実行してください。", _
+            vbExclamation, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    '========================================================
+    ' 6. 保存予定SLDDRWのパスを作成
+    ' 例：C:\Parts\FB01.SLDPRT → C:\Parts\FB01.SLDDRW
+    '========================================================
+    drawingPath = BuildDrawingPath(partPath)
+
+    '========================================================
+    ' 7. 同名SLDDRWが既に存在しないか確認
+    ' 最重要安全処理
+    ' 図面を作り始める前に確認する
+    '========================================================
+    If FileExists(drawingPath) Then
+        MsgBox _
+            "同名の図面ファイルが既に存在するため、処理を中止しました。" & _
+            vbCrLf & vbCrLf & _
+            drawingPath, _
+            vbExclamation, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    '========================================================
+    ' 8. 使用するdrwdotを決定
+    ' DRAW_TEMPLATE_PATHが空欄なら、
+    ' SOLIDWORKSの既定図面テンプレートを取得
+    '========================================================
+    drawingTemplatePath = GetDrawingTemplatePath(swApp)
+    If Len(drawingTemplatePath) = 0 Then
+        MsgBox _
+            "新規図面用のdrwdotを取得できませんでした。" & vbCrLf & vbCrLf & _
+            "DRAW_TEMPLATE_PATHを設定してください。", _
+            vbCritical, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    '========================================================
+    ' 9. 必要ファイルが存在するか確認
+    ' 図面を作成する前に全てチェックする
+    '========================================================
+    If Not FileExists(drawingTemplatePath) Then
+        MsgBox _
+            "図面テンプレート（drwdot）が見つかりません。" & _
+            vbCrLf & vbCrLf & _
+            drawingTemplatePath, _
+            vbCritical, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    If Not FileExists(SHEET_FORMAT_PATH) Then
+        MsgBox _
+            "A4シートフォーマット（slddrt）が見つかりません。" & _
+            vbCrLf & vbCrLf & _
+            SHEET_FORMAT_PATH, _
+            vbCritical, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    If Not FileExists(BOM_TEMPLATE_PATH) Then
+        MsgBox _
+            "BOMテンプレートが見つかりません。" & _
+            vbCrLf & vbCrLf & _
+            BOM_TEMPLATE_PATH, _
+            vbCritical, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    If Not FileExists(QR_MACRO_PATH) Then
+        MsgBox _
+            "QRコード挿入マクロが見つかりません。" & _
+            vbCrLf & vbCrLf & _
+            QR_MACRO_PATH, _
+            vbCritical, _
+            "図面自動作成"
+        Exit Sub
+    End If
+
+    '========================================================
+    ' 10. 新規図面を作成
+    '========================================================
+    Set swDrawModel = swApp.NewDocument( _
+        drawingTemplatePath, _
+        0, _
+        0#, _
+        0#)
+    If swDrawModel Is Nothing Then
+        Err.Raise _
+            vbObjectError + 1000, _
+            "図面自動作成", _
+            "新規図面を作成できませんでした。"
+    End If
+
+    Set swDraw = swDrawModel
+
+    '========================================================
+    ' 11. 現在のシートを取得
+    '========================================================
+    Set swSheet = swDraw.GetCurrentSheet
+    If swSheet Is Nothing Then
+        Err.Raise _
+            vbObjectError + 1001, _
+            "図面自動作成", _
+            "図面シートを取得できませんでした。"
+    End If
+
+    '========================================================
+    ' 12. A4縦サイズに設定
+    ' 記録マクロでは、PaperSz = 12、Templ = 12となっていた。
+    ' 12 = UserDefined / Custom
+    ' 幅210mm × 高さ297mm
+    ' FirstAngle = False → 第三角法
+    '========================================================
+    swSheet.SetProperties2 _
+        swDwgPapersUserDefined, _
+        swDwgTemplateCustom, _
+        1#, _
+        2#, _
+        False, _
+        0.21, _
+        0.297, _
+        True
+
+    '========================================================
+    ' 13. A4シートフォーマットを適用
+    '========================================================
+    swSheet.SetTemplateName SHEET_FORMAT_PATH
+    swSheet.ReloadTemplate True
+    swDrawModel.EditRebuild3
+
+    '========================================================
+    ' 14. SOLIDWORKSの自動縮尺設定を一時的にON    '
+    ' 元の設定を保存する。マクロ完了後、必ず元へ戻す。
+    '========================================================
+    oldAutoScale = swApp.GetUserPreferenceToggle( _
+        swAutomaticScaling3ViewDrawings)
+    If oldAutoScale = False Then
+        swApp.SetUserPreferenceToggle _
+            swAutomaticScaling3ViewDrawings, _
+            True
+        autoScaleChanged = True
+    End If
+
+    '========================================================
+    ' 15. 第三角法3面図を作成
+    ' SLDPRTの標準正面方向を基準に、正面、上面、右側面自動配置させる
+    '========================================================
+    boolStatus = swDraw.Create3rdAngleViews2(partPath)
+
+    '========================================================
+    ' 自動縮尺設定を元に戻す
+    '========================================================
+    If autoScaleChanged Then
+        swApp.SetUserPreferenceToggle _
+            swAutomaticScaling3ViewDrawings, _
+            oldAutoScale
+        autoScaleChanged = False
+    End If
+
+    If boolStatus = False Then
+        Err.Raise _
+            vbObjectError + 1002, _
+            "図面自動作成", _
+            "第三角法3面図の作成に失敗しました。"
+    End If
+
+    swDrawModel.EditRebuild3
+
+    '========================================================
+    ' 16. モデルアイテムを挿入    '
+    ' swInsertDimensions              = 8
+    ' swInsertDimensionsMarkedForDrawing = 32768
+    ' swInsertholeCallout             = 1048576    '
+    ' 記録マクロ：32776 = 8 + 32768
+    '========================================================
+    annotationTypes = _
+        swInsertDimensions Or _
+        swInsertDimensionsMarkedForDrawing Or _
+        swInsertholeCallout
+    swDrawModel.ClearSelection2 True
+    vAnnotations = swDraw.InsertModelAnnotations3( _
+        0, _
+        annotationTypes, _
+        True, _
+        True, _
+        False, _
+        True)
+
+    '========================================================
+    ' 17. 今回追加された「寸法だけ」を選択
+    ' InsertModelAnnotations3から返ってきたAnnotation配列
+    ' の中からswDisplayDimensionだけを選択する。
+    '========================================================
+    dimensionCount = 0
+    If IsArray(vAnnotations) Then
+        Set swSelMgr = swDrawModel.SelectionManager
+        Set swSelData = swSelMgr.CreateSelectData
+        swDrawModel.ClearSelection2 True
+        For i = LBound(vAnnotations) To UBound(vAnnotations)
+            Set swAnnotation = Nothing
+            On Error Resume Next
+            Set swAnnotation = vAnnotations(i)
+            On Error GoTo ErrorHandler
+            If Not swAnnotation Is Nothing Then
+
+                '--------------------------------------------
+                ' Annotationの種類が「表示寸法」の場合のみ選択
+                '--------------------------------------------
+                If swAnnotation.GetType = swDisplayDimension Then
+                    boolStatus = swAnnotation.Select3( _
+                        True, _
+                        swSelData)
+                    If boolStatus Then
+                        dimensionCount = dimensionCount + 1
+                    End If
+                End If
+            End If
+        Next i
+
+        '====================================================
+        ' 18. 選択された寸法を自動配列
+        '====================================================
+        If dimensionCount > 0 Then
+            boolStatus = swDrawModel.Extension.AlignDimensions( _
+                swAlignDimensionType_AutoArrange, _
+                AUTO_ARRANGE_SPACING)
+
+            '自動配列に失敗しても図面作成自体は継続する
+            If boolStatus = False Then
+                Debug.Print _
+                    "警告：寸法の自動配列に失敗しました。"
+            End If
+        End If
+    End If
+
+    swDrawModel.ClearSelection2 True
+
+    '========================================================
+    ' 19. 正面図を取得    '
+    ' "*Front" を探す。
+    ' 見つからなかった場合は、最初のモデルビューを使用する。
+    '========================================================
+    Set swFrontView = FindFrontView(swDraw)
+    If swFrontView Is Nothing Then
+        Err.Raise _
+            vbObjectError + 1003, _
+            "図面自動作成", _
+            "BOM挿入用の図面ビューを取得できませんでした。"
+    End If
+
+    '========================================================
+    ' 20. 正面図が参照しているConfiguration名を取得
+    '========================================================
+    configName = swFrontView.ReferencedConfiguration
+
+    '========================================================
+    ' 21. BOMを挿入
+    ' 暫定位置はコード序盤で定義。
+    ' BOM右上を基準に配置する。Parts Onlyを使用。
+    '========================================================
+    Set swBomTable = swFrontView.InsertBomTable4( _
+        False, _
+        BOM_X_MM / 1000#, _
+        BOM_Y_MM / 1000#, _
+        swBOMConfigurationAnchor_TopRight, _
+        swBomType_PartsOnly, _
+        configName, _
+        BOM_TEMPLATE_PATH, _
+        False, _
+        0, _
+        False)
+    If swBomTable Is Nothing Then
+        Err.Raise _
+            vbObjectError + 1004, _
+            "図面自動作成", _
+            "部品表の挿入に失敗しました。"
+    End If
+
+    swDrawModel.EditRebuild3
+
+    '========================================================
+    ' 22. QRマクロを実行する前に選択状態を完全に解除
+    '========================================================
+    swDrawModel.ClearSelection2 True
+    swDraw.ActivateSheet swSheet.GetName
+
+    '========================================================
+    ' 23. QR_test02を実行
+    ' ファイル：QR_test02.swp
+    ' モジュール：QR_test021
+    ' Sub：main
+    '========================================================
+    qrResult = swApp.RunMacro2( _
+        QR_MACRO_PATH, _
+        QR_MODULE_NAME, _
+        QR_PROCEDURE_NAME, _
+        swRunMacroUnloadAfterRun, _
+        qrError)
+    If qrResult = False Then
+        Err.Raise _
+            vbObjectError + 1005, _
+            "図面自動作成", _
+            "QR_test02の実行に失敗しました。" & _
+            vbCrLf & _
+            "RunMacro2 Error = " & CStr(qrError)
+    End If
+
+    '========================================================
+    ' 24. 再構築
+    '========================================================
+    swDrawModel.EditRebuild3
+
+    '========================================================
+    ' 25. 同じフォルダ・同じ名前でSLDDRW保存
+    ' 事前に存在確認済みなので上書きは発生しない。
+    ' SaveAs3：0 = 成功
+    '========================================================
+    swDrawModel.ClearSelection2 True
+    saveStatus = swDrawModel.SaveAs3( _
+        drawingPath, _
+        swSaveAsCurrentVersion, _
+        swSaveAsOptions_Silent)
+    If saveStatus <> 0 Then
+        Err.Raise _
+            vbObjectError + 1006, _
+            "図面自動作成", _
+            "SLDDRWの保存に失敗しました。" & _
+            vbCrLf & _
+            "SaveAs3 Status = " & CStr(saveStatus)
+    End If
+
+    '========================================================
+    ' 26. 全体表示
+    '========================================================
+    swDrawModel.ViewZoomtofit2
+
+    '========================================================
+    ' 27. 完了
+    '========================================================
+    MsgBox _
+        "図面の自動作成が完了しました。" & _
+        vbCrLf & vbCrLf & _
+        "保存先：" & vbCrLf & _
+        drawingPath & _
+        vbCrLf & vbCrLf & _
+        "自動配列した寸法数：" & _
+        CStr(dimensionCount), _
+        vbInformation, _
+        "図面自動作成"
+    Exit Sub
+
+'============================================================
+' エラー処理
+'============================================================
+
+ErrorHandler:
+
+    '--------------------------------------------------------
+    ' 自動縮尺の設定を変更した状態でエラーになった場合、
+    ' SOLIDWORKSの設定を元に戻す
+    '--------------------------------------------------------
+    On Error Resume Next
+    If autoScaleChanged Then
+        swApp.SetUserPreferenceToggle _
+            swAutomaticScaling3ViewDrawings, _
+            oldAutoScale
+    End If
+
+    On Error GoTo 0
+
+    '--------------------------------------------------------
+    ' エラー時は図面を勝手に閉じない。
+    ' 途中まで作成された図面をユーザーが確認できるようにする。
+    '--------------------------------------------------------
+    MsgBox _
+        "図面自動作成マクロを中止しました。" & _
+        vbCrLf & vbCrLf & _
+        "エラー番号：" & CStr(Err.Number) & _
+        vbCrLf & _
+        "内容：" & Err.Description & _
+        vbCrLf & vbCrLf & _
+        "途中まで作成された図面が開いている場合は、" & _
+        "その状態を確認してください。", _
+        vbCritical, _
+        "図面自動作成"
+End Sub
+
+'============================================================
+' SLDPRTから保存予定SLDDRWパスを作成
+'============================================================
+
+Private Function BuildDrawingPath( _
+    ByVal partPath As String) As String
+    Dim dotPos As Long
+    dotPos = InStrRev(partPath, ".")
+    If dotPos > 0 Then
+        BuildDrawingPath = _
+            Left$(partPath, dotPos - 1) & ".SLDDRW"
+    Else
+        BuildDrawingPath = _
+            partPath & ".SLDDRW"
+    End If
+
+End Function
+
+'============================================================
+' ファイル存在確認
+'============================================================
+
+Private Function FileExists( _
+    ByVal filePath As String) As Boolean
+    If Len(filePath) = 0 Then
+        FileExists = False
+        Exit Function
+    End If
+
+    FileExists = (Len(Dir$(filePath)) > 0)
+End Function
+
+'============================================================
+' 使用するdrwdotを取得'
+' DRAW_TEMPLATE_PATHに指定がある場合→そのパスを使用
+' DRAW_TEMPLATE_PATHが空欄の場合→SOLIDWORKSの既定図面テンプレートを使用
+'============================================================
+
+Private Function GetDrawingTemplatePath( _
+    ByVal swApp As SldWorks.SldWorks) As String
+    If Len(Trim$(DRAW_TEMPLATE_PATH)) > 0 Then
+        GetDrawingTemplatePath = DRAW_TEMPLATE_PATH
+    Else
+        GetDrawingTemplatePath = _
+            swApp.GetUserPreferenceStringValue( _
+                swDefaultTemplateDrawing)
+    End If
+
+End Function
+
+'============================================================
+' 正面図を取得'
+' GetFirstViewで最初に取得されるのは「シート」なので、
+' GetNextViewで最初のモデルビューへ進む。'
+' 原則 "*Front" を探す。'
+' "*Front" が取得できなかった場合は最初のモデルビューを返す。
+'============================================================
+
+Private Function FindFrontView( _
+    ByVal swDraw As SldWorks.DrawingDoc) As SldWorks.View
+    Dim swView As SldWorks.View
+    Dim swFirstModelView As SldWorks.View
+    Dim orientationName As String
+
+    '--------------------------------------------------------
+    ' 最初はSheet View
+    '--------------------------------------------------------
+    Set swView = swDraw.GetFirstView
+    If swView Is Nothing Then
+        Set FindFrontView = Nothing
+        Exit Function
+    End If
+
+    '--------------------------------------------------------
+    ' 最初の実モデルビューへ
+    '--------------------------------------------------------
+    Set swView = swView.GetNextView
+    Do While Not swView Is Nothing
+
+        '----------------------------------------------------
+        ' 最初のモデルビューをバックアップとして保持
+        '----------------------------------------------------
+        If swFirstModelView Is Nothing Then
+            Set swFirstModelView = swView
+        End If
+
+        '----------------------------------------------------
+        ' 元モデル上のビュー方向を取得
+        '----------------------------------------------------
+        orientationName = ""
+        On Error Resume Next
+        orientationName = swView.GetOrientationName
+        On Error GoTo 0
+
+        '----------------------------------------------------
+        ' 正面図なら返す
+        '----------------------------------------------------
+        If StrComp( _
+            orientationName, _
+            "*Front", _
+            vbTextCompare) = 0 Then
+            Set FindFrontView = swView
+            Exit Function
+        End If
+
+        Set swView = swView.GetNextView
+    Loop
+
+    '--------------------------------------------------------
+    ' *Frontが見つからなければ最初のモデルビューを使用
+    '--------------------------------------------------------
+    Set FindFrontView = swFirstModelView
+End Function
+
+
