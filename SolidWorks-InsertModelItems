@@ -3,8 +3,18 @@ Option Explicit
 '============================================================
 ' 図面自動作成マクロ
 '
-' Version : 1.0
-' Date    : 2026/09/24
+' Version : 1.1
+' Date    : 2026/09/25
+'
+' 【変更履歴】
+' v1.0  2026/09/24
+'   ・初版作成
+'
+' v1.1  2026/09/25
+'   ・シートフォーマット再読込時の注記重複を修正
+'   ・3面図の表示スタイルを「隠線表示」に変更
+'   ・部品表B列の参照プロパティを「名称」から「品名」に変更
+'   ・エラー発生時に停止箇所・エラー内容を表示する処理を追加
 '
 ' 【処理概要】
 '  1. アクティブ文書がSLDPRTか確認
@@ -16,12 +26,14 @@ Option Explicit
 '     ・正面図
 '     ・右側面図
 '     ・平面図
+'     ・表示スタイル：隠線表示
 '  7. モデルアイテムを挿入
 '     ・モデル全体
 '     ・図面に指定された寸法
 '     ・穴寸法テキスト
 '  8. 今回挿入した寸法だけ自動配列
 '  9. 正面図を基準に部品表を挿入
+'     ・B列の参照プロパティを「品名」に設定
 ' 10. QR_test02.swpを実行
 ' 11. 元SLDPRTと同じフォルダへ同名SLDDRWとして保存
 '============================================================
@@ -95,8 +107,11 @@ Sub main()
     Dim oldAutoScale As Boolean
     Dim autoScaleChanged As Boolean
 
-    ' エラー発生時は ErrorHandler へ
+    ' エラー発生時は ErrorHandler
     On Error GoTo ErrorHandler
+    Dim currentStep As String
+    Dim savedErrNumber As Long
+    Dim savedErrDescription As String
 
     ' 1. SOLIDWORKSへ接続
     Set swApp = Application.SldWorks
@@ -281,7 +296,7 @@ Sub main()
     ' 13. A4シートフォーマットを適用
     '========================================================
     swSheet.SetTemplateName SHEET_FORMAT_PATH
-    swSheet.ReloadTemplate True
+    swSheet.ReloadTemplate False
     swDrawModel.EditRebuild3
 
     '========================================================
@@ -321,6 +336,8 @@ Sub main()
     End If
 
     swDrawModel.EditRebuild3
+    
+    SetAllViewsHiddenLinesVisible swDraw
 
     '========================================================
     ' 16. モデルアイテムを挿入    '
@@ -411,9 +428,10 @@ Sub main()
 
     '========================================================
     ' 21. BOMを挿入
-    ' 暫定位置はコード序盤で定義。
-    ' BOM右上を基準に配置する。Parts Onlyを使用。
     '========================================================
+    
+    currentStep = "21. BOM挿入"
+    
     Set swBomTable = swFrontView.InsertBomTable4( _
         False, _
         BOM_X_MM / 1000#, _
@@ -425,42 +443,61 @@ Sub main()
         False, _
         0, _
         False)
+    
     If swBomTable Is Nothing Then
         Err.Raise _
             vbObjectError + 1004, _
             "図面自動作成", _
             "部品表の挿入に失敗しました。"
     End If
-
+    
     swDrawModel.EditRebuild3
-
+    
+    ' B列の参照カスタムプロパティを「品名」に変更
+    boolStatus = swBomTable.SetColumnCustomProperty(1, "品名")
+    
+    If boolStatus = False Then
+        Debug.Print "警告：BOMのB列を「品名」に変更できませんでした。"
+    End If
+    
+    
     '========================================================
-    ' 22. QRマクロを実行する前に選択状態を完全に解除
+    ' 22. QR実行前準備
     '========================================================
+    
+    currentStep = "22. QR実行前の選択解除・シート切替"
+    
     swDrawModel.ClearSelection2 True
+    
     swDraw.ActivateSheet swSheet.GetName
-
+    
+    
     '========================================================
     ' 23. QR_test02を実行
-    ' ファイル：QR_test02.swp
-    ' モジュール：QR_test021
-    ' Sub：main
     '========================================================
+    
+    currentStep = "23. QR_test02実行"
+    
+    qrError = 0
+    
     qrResult = swApp.RunMacro2( _
         QR_MACRO_PATH, _
         QR_MODULE_NAME, _
         QR_PROCEDURE_NAME, _
         swRunMacroUnloadAfterRun, _
         qrError)
+    
     If qrResult = False Then
+    
         Err.Raise _
             vbObjectError + 1005, _
             "図面自動作成", _
             "QR_test02の実行に失敗しました。" & _
             vbCrLf & _
             "RunMacro2 Error = " & CStr(qrError)
+    
     End If
-
+    
     '========================================================
     ' 24. 再構築
     '========================================================
@@ -511,11 +548,13 @@ Sub main()
 
 ErrorHandler:
 
-    '--------------------------------------------------------
-    ' 自動縮尺の設定を変更した状態でエラーになった場合、
-    ' SOLIDWORKSの設定を元に戻す
-    '--------------------------------------------------------
+    ' 発生したエラー情報を最初に保存する
+    savedErrNumber = Err.Number
+    savedErrDescription = Err.Description
+
+    ' 自動縮尺設定を元に戻す
     On Error Resume Next
+
     If autoScaleChanged Then
         swApp.SetUserPreferenceToggle _
             swAutomaticScaling3ViewDrawings, _
@@ -524,21 +563,17 @@ ErrorHandler:
 
     On Error GoTo 0
 
-    '--------------------------------------------------------
-    ' エラー時は図面を勝手に閉じない。
-    ' 途中まで作成された図面をユーザーが確認できるようにする。
-    '--------------------------------------------------------
     MsgBox _
-        "図面自動作成マクロを中止しました。" & _
-        vbCrLf & vbCrLf & _
-        "エラー番号：" & CStr(Err.Number) & _
-        vbCrLf & _
-        "内容：" & Err.Description & _
-        vbCrLf & vbCrLf & _
+        "図面自動作成マクロを中止しました。" & vbCrLf & vbCrLf & _
+        "停止箇所：" & currentStep & vbCrLf & _
+        "エラー番号：" & CStr(savedErrNumber) & vbCrLf & _
+        "内容：" & savedErrDescription & vbCrLf & _
+        "RunMacro2 Error：" & CStr(qrError) & vbCrLf & vbCrLf & _
         "途中まで作成された図面が開いている場合は、" & _
         "その状態を確認してください。", _
         vbCritical, _
         "図面自動作成"
+
 End Sub
 
 '============================================================
@@ -655,4 +690,42 @@ Private Function FindFrontView( _
     Set FindFrontView = swFirstModelView
 End Function
 
+
+'============================================================
+' 図面上のすべてのモデルビューを隠線表示にする
+'============================================================
+
+Private Sub SetAllViewsHiddenLinesVisible( _
+    ByVal swDraw As SldWorks.DrawingDoc)
+
+    Dim swView As SldWorks.View
+    Dim boolStatus As Boolean
+
+    ' GetFirstViewで取得される最初のViewはシート
+    Set swView = swDraw.GetFirstView
+
+    If swView Is Nothing Then Exit Sub
+
+    ' 最初の実モデルビューへ進む
+    Set swView = swView.GetNextView
+
+    Do While Not swView Is Nothing
+
+        boolStatus = swView.SetDisplayMode3( _
+            False, _
+            swHIDDEN_GREYED, _
+            False, _
+            True)
+
+        If boolStatus = False Then
+            Debug.Print _
+                "警告：表示スタイルを変更できませんでした：" & _
+                swView.Name
+        End If
+
+        Set swView = swView.GetNextView
+
+    Loop
+
+End Sub
 
